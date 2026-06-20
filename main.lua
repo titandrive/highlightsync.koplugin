@@ -12,7 +12,6 @@ local Merge = require("merge")
 local rapidjson = require("rapidjson")
 local NetworkMgr = require("ui/network/manager")
 local logger = require("logger")
-local SyncGuard = require("sync_guard")
 
 local is_reloading_due_to_sync = false
 
@@ -142,12 +141,18 @@ function Highlightsync:init()
     self.is_syncing = false
 
     Highlightsync.settings = G_reader_settings:readSetting("highlight_sync", self.default_settings)
+    -- Migrate the marker used by v0.7.2-rc.1.
+    if self.settings.last_sync_attempt then
+        self.settings.sync_in_progress = true
+        self.settings.last_sync_attempt = nil
+        G_reader_settings:saveSetting("highlight_sync", self.settings)
+    end
     self:onDispatcherRegisterActions()
     self.ui.menu:registerToMainMenu(self)
 end
 
 function Highlightsync:shouldAutoSync()
-    return SyncGuard.canAutoSync(self.settings)
+    return not self.settings.sync_in_progress
 end
 
 function Highlightsync:onReaderReady()
@@ -266,7 +271,7 @@ function Highlightsync:SyncBookHighlights(silent, reload)
     -- Write the attempt marker to disk BEFORE the blocking call. If the
     -- process is killed mid-download, automatic sync stays disabled until a
     -- manual sync completes successfully and clears the marker.
-    SyncGuard.markAttempt(self.settings)
+    self.settings.sync_in_progress = true
     G_reader_settings:saveSetting("highlight_sync", self.settings)
 
     self.is_syncing = true
@@ -277,7 +282,7 @@ function Highlightsync:SyncBookHighlights(silent, reload)
             local success = self:onSync(local_path, cached_path, income_path, reload,
                                         sidecar_dir, file_name, data_annotations)
             self.is_syncing = false
-            SyncGuard.clearAttempt(self.settings)
+            self.settings.sync_in_progress = nil
             G_reader_settings:saveSetting("highlight_sync", self.settings)
             return success
         end,
