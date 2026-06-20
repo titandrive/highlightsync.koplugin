@@ -12,6 +12,7 @@ local Merge = require("merge")
 local rapidjson = require("rapidjson")
 local NetworkMgr = require("ui/network/manager")
 local logger = require("logger")
+local SyncGuard = require("sync_guard")
 
 local is_reloading_due_to_sync = false
 
@@ -145,11 +146,8 @@ function Highlightsync:init()
     self.ui.menu:registerToMainMenu(self)
 end
 
-local AUTO_SYNC_COOLDOWN = 120 -- seconds before retrying auto-sync after a crash/failure
-
 function Highlightsync:shouldAutoSync()
-    if not self.settings.last_sync_attempt then return true end
-    return (os.time() - self.settings.last_sync_attempt) >= AUTO_SYNC_COOLDOWN
+    return SyncGuard.canAutoSync(self.settings)
 end
 
 function Highlightsync:onReaderReady()
@@ -161,7 +159,11 @@ function Highlightsync:onReaderReady()
 
     if self.settings.sync_on_open and self:canSync() then
         UIManager:nextTick(function()
-            if NetworkMgr:isWifiOn() and self:shouldAutoSync() then
+            if not self:shouldAutoSync() then
+                UIManager:show(InfoMessage:new{
+                    text = _("Automatic highlight sync was skipped because the previous sync did not finish. Run 'Sync Highlights' manually to retry."),
+                })
+            elseif NetworkMgr:isWifiOn() then
                 self:SyncBookHighlights(false, true)
             end
         end)
@@ -175,7 +177,7 @@ function Highlightsync:onCloseDocument()
     end
 
     if self.settings.sync_on_close and self:canSync() then
-        if NetworkMgr:isWifiOn() then
+        if NetworkMgr:isWifiOn() and self:shouldAutoSync() then
             self:SyncBookHighlights(false, false)
         end
     end
@@ -261,10 +263,10 @@ function Highlightsync:SyncBookHighlights(silent, reload)
 
     write_json_file(sync_file, data_annotations)
 
-    -- Write attempt timestamp to disk BEFORE the blocking call.
-    -- If the process is killed mid-download, the next startup will see this
-    -- and skip auto-sync for AUTO_SYNC_COOLDOWN seconds.
-    self.settings.last_sync_attempt = os.time()
+    -- Write the attempt marker to disk BEFORE the blocking call. If the
+    -- process is killed mid-download, automatic sync stays disabled until a
+    -- manual sync completes successfully and clears the marker.
+    SyncGuard.markAttempt(self.settings)
     G_reader_settings:saveSetting("highlight_sync", self.settings)
 
     self.is_syncing = true
@@ -275,7 +277,7 @@ function Highlightsync:SyncBookHighlights(silent, reload)
             local success = self:onSync(local_path, cached_path, income_path, reload,
                                         sidecar_dir, file_name, data_annotations)
             self.is_syncing = false
-            self.settings.last_sync_attempt = nil
+            SyncGuard.clearAttempt(self.settings)
             G_reader_settings:saveSetting("highlight_sync", self.settings)
             return success
         end,
@@ -285,7 +287,7 @@ function Highlightsync:SyncBookHighlights(silent, reload)
     if not ok then
         logger.warn("Highlightsync: sync failed:", err)
         self.is_syncing = false
-        -- last_sync_attempt stays set as a cooldown marker for auto-sync
+        -- Keep the attempt marker set so automatic sync cannot cause a loop.
     end
 end
 
