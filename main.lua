@@ -13,10 +13,6 @@ local rapidjson = require("rapidjson")
 local NetworkMgr = require("ui/network/manager")
 local logger = require("logger")
 
-local is_reloading_due_to_sync = false
-
-
-
 local function dir_exists(path)
     local ok, _, code = os.rename(path, path)
     if not ok then
@@ -156,12 +152,6 @@ function Highlightsync:shouldAutoSync()
 end
 
 function Highlightsync:onReaderReady()
-
-    if is_reloading_due_to_sync then
-        is_reloading_due_to_sync = false
-        return
-    end
-
     if self.settings.sync_on_open and self:canSync() then
         UIManager:nextTick(function()
             if not self:shouldAutoSync() then
@@ -176,11 +166,6 @@ function Highlightsync:onReaderReady()
 end
 
 function Highlightsync:onCloseDocument()
-
-    if is_reloading_due_to_sync then
-        return
-    end
-
     if self.settings.sync_on_close and self:canSync() then
         if NetworkMgr:isWifiOn() and self:shouldAutoSync() then
             self:SyncBookHighlights(false, false)
@@ -204,7 +189,7 @@ end
 
 
 
-function Highlightsync:onSync(local_path, cached_path, income_path, reload, sidecar_dir, file_name, data_annotations)
+function Highlightsync:onSync(local_path, cached_path, income_path, refresh, sidecar_dir, file_name, data_annotations)
 
     local local_highlights  = data_annotations
     local cached_highlights = read_json_file(cached_path) or {}
@@ -216,11 +201,14 @@ function Highlightsync:onSync(local_path, cached_path, income_path, reload, side
 
     if self.ui and self.ui.annotation then
         self.ui.annotation.annotations = annotations
-        if reload then
-            is_reloading_due_to_sync = true
-            UIManager:tickAfterNext(function()
-                self.ui:reloadDocument()
-            end)
+        if refresh then
+            -- ReaderView caches the boxes used to draw highlights. Clear that
+            -- cache and repaint in place so synced annotations appear without
+            -- closing and reopening the document.
+            if self.ui.view and self.ui.view.resetHighlightBoxesCache then
+                self.ui.view:resetHighlightBoxesCache()
+            end
+            UIManager:setDirty(self.ui, "ui")
         end
     end
 
@@ -248,7 +236,7 @@ function Highlightsync:onSyncBookHighlights()
         self:SyncBookHighlights(false, true)   
 end
 
-function Highlightsync:SyncBookHighlights(silent, reload)
+function Highlightsync:SyncBookHighlights(silent, refresh)
     if not self:canSync() then return end
 
     if self.is_syncing then
@@ -279,7 +267,7 @@ function Highlightsync:SyncBookHighlights(silent, reload)
     local ok, err = pcall(function()
         SyncService.sync(self.settings.sync_server, sync_file,
         function(local_path, cached_path, income_path)
-            local success = self:onSync(local_path, cached_path, income_path, reload,
+            local success = self:onSync(local_path, cached_path, income_path, refresh,
                                         sidecar_dir, file_name, data_annotations)
             self.is_syncing = false
             self.settings.sync_in_progress = nil

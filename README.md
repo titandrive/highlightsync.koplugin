@@ -66,10 +66,10 @@ If you use KOReader's **"Hash based"** setting for metadata location (instead of
 **Crucial:** You must ensure **ALL your devices use the same metadata setting**.
 * If Device A uses **Hash-based** and Device B uses **File location**, Device A will look for a hashed filename while Device B looks for the book title filename. They will **not** see each other's highlights.
 
-### ⏳ Sync Freeze & Reload
+### ⏳ Sync Freeze & Refresh
 During synchronization, you might experience a **brief freeze** (UI blocking) for a few seconds.
 * This is normal behavior due to KOReader's single-core architecture handling the network request and JSON processing.
-* After syncing, the plugin will trigger a **document reload**. This is necessary for KOReader to visually render the newly imported highlights on the page.
+* After syncing, the plugin refreshes the current view in place so newly imported highlights appear without closing and reopening the book.
 
 ---
 
