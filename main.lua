@@ -11,6 +11,7 @@ local SyncService = require("frontend/apps/cloudstorage/syncservice")
 local Merge = require("merge")
 local rapidjson = require("rapidjson")
 local NetworkMgr = require("ui/network/manager")
+local socketutil = require("socketutil")
 local logger = require("logger")
 
 local is_reloading_due_to_sync = false
@@ -272,21 +273,20 @@ function Highlightsync:SyncBookHighlights(silent, reload)
 
     self.is_syncing = true
 
-    -- LuaSocket has no default timeout, so a stalled server blocks forever and
-    -- triggers an Android ANR. Patch socket.tcp for the duration of this call
-    -- so every socket operation times out after 8 seconds, giving the sync a
-    -- chance to fail gracefully before Android kills the process.
-    local socket = require("socket")
-    local orig_tcp = socket.tcp
-    socket.tcp = function()
-        local s = orig_tcp()
-        if s then s:settimeout(8) end
-        return s
-    end
+    -- WebDavApi:downloadFile calls socketutil:set_timeout(FILE_BLOCK_TIMEOUT, FILE_TOTAL_TIMEOUT),
+    -- which sets https.TIMEOUT. LuaSec's conn:settimeout always uses https.TIMEOUT (ignoring its
+    -- argument), so this is the correct interception point. The default FILE_BLOCK_TIMEOUT of 15s
+    -- lets the UI thread freeze long enough for Android to show an ANR dialog.
+    local orig_file_block = socketutil.FILE_BLOCK_TIMEOUT
+    local orig_file_total = socketutil.FILE_TOTAL_TIMEOUT
+    socketutil.FILE_BLOCK_TIMEOUT = 4
+    socketutil.FILE_TOTAL_TIMEOUT = 10
 
+    local callback_called = false
     local ok, err = pcall(function()
         SyncService.sync(self.settings.sync_server, sync_file,
         function(local_path, cached_path, income_path)
+            callback_called = true
             local success = self:onSync(local_path, cached_path, income_path, reload,
                                         sidecar_dir, file_name, data_annotations)
             self.is_syncing = false
@@ -298,12 +298,20 @@ function Highlightsync:SyncBookHighlights(silent, reload)
         silent)
     end)
 
-    socket.tcp = orig_tcp
+    socketutil.FILE_BLOCK_TIMEOUT = orig_file_block
+    socketutil.FILE_TOTAL_TIMEOUT = orig_file_total
 
     if not ok then
         logger.warn("Highlightsync: sync error:", err)
+    end
+    if not callback_called then
+        -- SyncService returned without calling our callback: download failed,
+        -- server unreachable, or NetworkMgr deferred the call. Reset syncing
+        -- state so the next manual or auto-sync attempt can proceed.
         self.is_syncing = false
-        -- sync_in_progress left set: 300s cooldown before auto-sync retries
+        self.settings.sync_in_progress = nil
+        self.settings.sync_start_time = nil
+        G_reader_settings:saveSetting("highlight_sync", self.settings)
     end
 end
 
