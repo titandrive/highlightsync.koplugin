@@ -1,10 +1,14 @@
 local function parse_datetime_cached()
     local cache = {}
     return function(str)
-        if not str then return 0 end
+        if type(str) ~= "string" then return 0 end
         if cache[str] then return cache[str] end
         local y, m, d, h, min, s = str:match("(%d+)-(%d+)-(%d+) (%d+):(%d+):(%d+)")
-        local t = os.time{year=tonumber(y), month=tonumber(m), day=tonumber(d), hour=tonumber(h), min=tonumber(min), sec=tonumber(s)}
+        if not y then return 0 end
+        local t = os.time{
+            year = tonumber(y), month = tonumber(m), day = tonumber(d),
+            hour = tonumber(h), min = tonumber(min), sec = tonumber(s),
+        } or 0
         cache[str] = t
         return t
     end
@@ -21,13 +25,32 @@ local function get_newer(item1, item2)
     return t1 >= t2 and item1 or item2
 end
 
+local function serialize_position(value)
+    if type(value) ~= "table" then
+        return tostring(value)
+    end
+
+    local keys = {}
+    for key in pairs(value) do
+        keys[#keys + 1] = key
+    end
+    table.sort(keys, function(a, b) return tostring(a) < tostring(b) end)
+
+    local parts = {}
+    for _, key in ipairs(keys) do
+        parts[#parts + 1] = tostring(key) .. "=" .. serialize_position(value[key])
+    end
+    return "{" .. table.concat(parts, ",") .. "}"
+end
+
 -- Generate a stable key using pos0+pos1 (XPath positions) which are consistent
 -- across devices regardless of font size, screen size, or page layout settings.
+-- PDF positions are tables, so serialize their contents deterministically rather
+-- than using tostring(table), which contains a device-local memory address.
 -- Falls back to page + text hash for older annotations without position data.
 local function generate_key(highlight)
-    -- Use pos0 + pos1 as primary key (stable across devices)
     if highlight.pos0 and highlight.pos1 then
-        return string.format("%s|%s", highlight.pos0, highlight.pos1)
+        return serialize_position(highlight.pos0) .. "|" .. serialize_position(highlight.pos1)
     end
     -- Fallback: use page + text hash for annotations without position data
     local text = highlight.text or ""
@@ -92,8 +115,9 @@ local function merge_highlights(local_annotations, server_annotations, last_sync
         -- as is the case with pdf highlights
         if type(a.pos0) == "table" then
           if type(b.pos0) == "table" then
-            return a.pos0.y < b.pos0.y or
-                  (a.pos0.y == b.pos0.y and a.pos0.x < b.pos0.y)
+            local ay, by = a.pos0.y or 0, b.pos0.y or 0
+            local ax, bx = a.pos0.x or 0, b.pos0.x or 0
+            return ay < by or (ay == by and ax < bx)
           end
           -- Posistions can't be compared
           return false

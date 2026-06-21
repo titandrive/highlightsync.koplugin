@@ -9,9 +9,13 @@ local WidgetContainer = require("ui/widget/container/widgetcontainer")
 local _ = require("gettext")
 local SyncService = require("frontend/apps/cloudstorage/syncservice")
 local Merge = require("merge")
+local Transport = require("transport")
 local rapidjson = require("rapidjson")
 local NetworkMgr = require("ui/network/manager")
 local logger = require("logger")
+
+local SYNC_POLL_INTERVAL = 0.25
+local SYNC_MAX_POLLS = 240 -- 60 seconds
 
 local function dir_exists(path)
     local ok, _, code = os.rename(path, path)
@@ -124,7 +128,7 @@ function Highlightsync:onDispatcherRegisterActions()
 end
 
 Highlightsync.default_settings = {
-       is_enabled = true,
+    is_enabled = true,
 }
 
 
@@ -137,7 +141,7 @@ function Highlightsync:init()
     self.is_syncing = false
 
     Highlightsync.settings = G_reader_settings:readSetting("highlight_sync", self.default_settings)
-    -- Migrate the marker used by v0.7.2-rc.1.
+    -- Migrate the attempt marker used by an earlier development version.
     if self.settings.last_sync_attempt then
         self.settings.sync_in_progress = true
         self.settings.last_sync_attempt = nil
@@ -151,6 +155,11 @@ function Highlightsync:shouldAutoSync()
     return not self.settings.sync_in_progress
 end
 
+function Highlightsync:clearSyncMarker()
+    self.settings.sync_in_progress = nil
+    G_reader_settings:saveSetting("highlight_sync", self.settings)
+end
+
 function Highlightsync:onReaderReady()
     if self.settings.sync_on_open and self:canSync() then
         UIManager:nextTick(function()
@@ -158,7 +167,7 @@ function Highlightsync:onReaderReady()
                 UIManager:show(InfoMessage:new{
                     text = _("Automatic highlight sync was skipped because the previous sync did not finish. Run 'Sync Highlights' manually to retry."),
                 })
-            elseif NetworkMgr:isWifiOn() then
+            elseif NetworkMgr:isConnected() then
                 self:SyncBookHighlights(false, true)
             end
         end)
@@ -167,20 +176,18 @@ end
 
 function Highlightsync:onCloseDocument()
     if self.settings.sync_on_close and self:canSync() then
-        if NetworkMgr:isWifiOn() and self:shouldAutoSync() then
+        if self:shouldAutoSync() and NetworkMgr:isConnected() then
             self:SyncBookHighlights(false, false)
         end
     end
 end
 
 function Highlightsync:onResume()
-
+    
     if self.settings.sync_on_resume then
         UIManager:nextTick(function()
-            if NetworkMgr:isWifiOn() and self:shouldAutoSync() then
+            if self:shouldAutoSync() and NetworkMgr:isConnected() then
                 self:SyncBookHighlights(false, true)
-                self.settings.pending_sync = false
-                G_reader_settings:saveSetting("highlight_sync", self.settings)
             end
         end)
     end
@@ -189,30 +196,55 @@ end
 
 
 
-function Highlightsync:onSync(local_path, cached_path, income_path, refresh, sidecar_dir, file_name, data_annotations)
-
-    local local_highlights  = data_annotations
+local function merge_sync_files(cached_path, income_path, context)
+    local local_highlights = context.annotations
     local cached_highlights = read_json_file(cached_path) or {}
     local income_highlights = read_json_file(income_path) or {}
 
     local annotations = Merge.Merge_highlights(local_highlights, income_highlights, cached_highlights)
 
-    write_json_file(sidecar_dir .. "/" .. file_name .. ".json", annotations)
+    if not write_json_file(context.sync_file, annotations) then
+        error("Unable to save merged annotations: " .. context.sync_file)
+    end
+    return true
+end
 
-    if self.ui and self.ui.annotation then
+function Highlightsync:onSyncComplete(refresh, context)
+    local synced_annotations = read_json_file(context.sync_file)
+
+    if self.ui and self.ui.annotation and self.document
+            and self.document.file == context.document_path then
+        -- The UI stayed responsive during sync, so annotations may have changed
+        -- in the meantime. Merge those edits against the just-synced snapshot.
+        local annotations = Merge.Merge_highlights(
+            self.ui.annotation.annotations,
+            synced_annotations,
+            context.annotations
+        )
+        write_json_file(context.sync_file, annotations)
         self.ui.annotation.annotations = annotations
-        if refresh then
-            -- ReaderView caches the boxes used to draw highlights. Clear that
-            -- cache and repaint in place so synced annotations appear without
-            -- closing and reopening the document.
-            if self.ui.view and self.ui.view.resetHighlightBoxesCache then
-                self.ui.view:resetHighlightBoxesCache()
-            end
+        if refresh and self.ui.view and self.ui.view.resetHighlightBoxesCache then
+            self.ui.view:resetHighlightBoxesCache()
             UIManager:setDirty(self.ui, "ui")
         end
     end
+end
 
-    return true
+local function write_sync_result(path, success, message)
+    local file = io.open(path, "w")
+    if not file then return end
+    file:write(success and "ok" or "error", "\n", message or "")
+    file:close()
+end
+
+local function read_sync_result(path)
+    local file = io.open(path, "r")
+    if not file then return false, "background sync produced no result" end
+    local status = file:read("*l")
+    local message = file:read("*a")
+    file:close()
+    os.remove(path)
+    return status == "ok", message
 end
 
 function Highlightsync:is_doc()
@@ -236,7 +268,7 @@ function Highlightsync:onSyncBookHighlights()
         self:SyncBookHighlights(false, true)   
 end
 
-function Highlightsync:SyncBookHighlights(silent, refresh)
+function Highlightsync:SyncBookHighlights(silent, reload)
     if not self:canSync() then return end
 
     if self.is_syncing then
@@ -248,40 +280,106 @@ function Highlightsync:SyncBookHighlights(silent, refresh)
     local doc_settings = self.ui and self.ui.doc_settings
     local sidecar_dir = doc_settings:getSidecarDir(doc_path)
     ensure_dir_exists(sidecar_dir)
-    local data_annotations = self.ui.annotation.annotations
+    local annotations = self.ui.annotation.annotations
 
     local raw_name = sidecar_dir:match("([^/]+)/*$")
     local file_name = sanitize_filename(raw_name)
     local sync_file = sidecar_dir .. "/" .. file_name .. ".json"
+    local context = {
+        annotations = annotations,
+        document_path = doc_path,
+        sync_file = sync_file,
+    }
+    local result_file = sync_file .. ".highlightsync-result"
+    os.remove(result_file)
 
-    write_json_file(sync_file, data_annotations)
+    if not write_json_file(sync_file, annotations) then
+        logger.warn("Highlightsync: unable to write local sync file:", sync_file)
+        return
+    end
 
-    -- Write the attempt marker to disk BEFORE the blocking call. If the
-    -- process is killed mid-download, automatic sync stays disabled until a
-    -- manual sync completes successfully and clears the marker.
     self.settings.sync_in_progress = true
     G_reader_settings:saveSetting("highlight_sync", self.settings)
-
     self.is_syncing = true
 
-    local ok, err = pcall(function()
-        SyncService.sync(self.settings.sync_server, sync_file,
-        function(local_path, cached_path, income_path)
-            local success = self:onSync(local_path, cached_path, income_path, refresh,
-                                        sidecar_dir, file_name, data_annotations)
-            self.is_syncing = false
-            self.settings.sync_in_progress = nil
-            G_reader_settings:saveSetting("highlight_sync", self.settings)
-            return success
-        end,
-        silent)
+    local server = self.settings.sync_server
+    local launch_ok, pid, launch_error = pcall(FFIUtil.runInSubProcess, function()
+        local ok, success, message = xpcall(function()
+            return Transport.sync(server, sync_file,
+                function(_, cached_path, incoming_path)
+                    return merge_sync_files(cached_path, incoming_path, context)
+                end
+            )
+        end, debug.traceback)
+        if not ok then
+            write_sync_result(result_file, false, success)
+        else
+            write_sync_result(result_file, success, message)
+        end
     end)
 
-    if not ok then
-        logger.warn("Highlightsync: sync failed:", err)
-        self.is_syncing = false
-        -- Keep the attempt marker set so automatic sync cannot cause a loop.
+    if not launch_ok then
+        launch_error = pid
+        pid = nil
     end
+
+    if not pid then
+        logger.warn("Highlightsync: unable to start background sync:", launch_error)
+        self.is_syncing = false
+        self:clearSyncMarker()
+        return
+    end
+
+    self.sync_process = pid
+    local polls = 0
+    local poll
+    poll = function()
+        polls = polls + 1
+        if not FFIUtil.isSubProcessDone(pid) then
+            if polls < SYNC_MAX_POLLS then
+                UIManager:scheduleIn(SYNC_POLL_INTERVAL, poll)
+                return
+            end
+            FFIUtil.terminateSubProcess(pid)
+            logger.warn("Highlightsync: background sync timed out.")
+            self.is_syncing = false
+            self.sync_process = nil
+            self:clearSyncMarker()
+            local reap
+            reap = function()
+                if FFIUtil.isSubProcessDone(pid) then
+                    os.remove(result_file)
+                else
+                    UIManager:scheduleIn(SYNC_POLL_INTERVAL, reap)
+                end
+            end
+            UIManager:scheduleIn(SYNC_POLL_INTERVAL, reap)
+            return
+        end
+
+        self.sync_process = nil
+        self.is_syncing = false
+        local success, message = read_sync_result(result_file)
+        self:clearSyncMarker()
+        if success then
+            self:onSyncComplete(reload, context)
+            if not silent then
+                UIManager:show(InfoMessage:new{
+                    text = _("Highlights synchronized."),
+                    timeout = 2,
+                })
+            end
+        else
+            logger.warn("Highlightsync: background sync failed:", message)
+            if not silent then
+                UIManager:show(InfoMessage:new{
+                    text = _("Highlight sync failed. Check the network connection and try again."),
+                    timeout = 3,
+                })
+            end
+        end
+    end
+    UIManager:scheduleIn(SYNC_POLL_INTERVAL, poll)
 end
 
 
@@ -301,6 +399,7 @@ function Highlightsync:addToMainMenu(menu_items)
                         end
                         sync_settings.onConfirm = function(sv)
                             self.settings.sync_server = sv
+                            G_reader_settings:saveSetting("highlight_sync", self.settings)
                             touchmenu_instance:updateItems()
                         end
                         UIManager:show(sync_settings)
@@ -322,6 +421,7 @@ function Highlightsync:addToMainMenu(menu_items)
                                 ok_text = _("Delete"),
                                 ok_callback = function()
                                     self.settings.sync_server = nil
+                                    G_reader_settings:saveSetting("highlight_sync", self.settings)
                                     touchmenu_instance:updateItems()
                                 end,
                             })
