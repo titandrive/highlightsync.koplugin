@@ -16,6 +16,11 @@ local logger = require("logger")
 
 local is_reloading_due_to_sync = false
 local AUTO_SYNC_COOLDOWN = 300 -- seconds; auto-sync skipped after a crash for this long
+local CURL_PATH = "/system/bin/curl"
+
+local function shell_quote(s)
+    return "'" .. tostring(s):gsub("'", "'\\''") .. "'"
+end
 
 
 
@@ -164,7 +169,7 @@ function Highlightsync:onReaderReady()
     if self.settings.sync_on_open and self:canSync() then
         UIManager:nextTick(function()
             if NetworkMgr:isWifiOn() and self:shouldAutoSync() then
-                self:SyncBookHighlights(false, true)
+                self:SyncBookHighlightsAsync(true)
             end
         end)
     end
@@ -188,7 +193,7 @@ function Highlightsync:onResume()
     if self.settings.sync_on_resume then
         UIManager:nextTick(function()
             if NetworkMgr:isWifiOn() and self:shouldAutoSync() then
-                self:SyncBookHighlights(false, true)
+                self:SyncBookHighlightsAsync(true)
                 self.settings.pending_sync = false
                 G_reader_settings:saveSetting("highlight_sync", self.settings)
             end
@@ -315,6 +320,143 @@ function Highlightsync:SyncBookHighlights(silent, reload)
     end
 end
 
+
+-- Non-blocking variant: download via curl subprocess, poll with UIManager:scheduleIn,
+-- then merge and upload on the main thread (upload is brief for small JSON files).
+-- Falls back to blocking SyncBookHighlights if curl is unavailable or server is not WebDAV.
+function Highlightsync:SyncBookHighlightsAsync(reload)
+    if not self:canSync() then return end
+    if self.is_syncing then
+        logger.warn("Highlightsync: Duplicate sync attempt ignored.")
+        return
+    end
+
+    local server = self.settings.sync_server
+    if not server or server.type ~= "webdav" then
+        self:SyncBookHighlights(false, reload)
+        return
+    end
+
+    local curl_f = io.open(CURL_PATH, "r")
+    if not curl_f then
+        self:SyncBookHighlights(false, reload)
+        return
+    end
+    curl_f:close()
+
+    local doc_path = self.document and self.document.file
+    local doc_settings = self.ui and self.ui.doc_settings
+    local sidecar_dir = doc_settings:getSidecarDir(doc_path)
+    ensure_dir_exists(sidecar_dir)
+
+    local raw_name = sidecar_dir:match("([^/]+)/*$")
+    local file_name = sanitize_filename(raw_name)
+    local sync_file   = sidecar_dir .. "/" .. file_name .. ".json"
+    local income_file = sync_file .. ".temp"
+    local cached_file = sync_file .. ".sync"
+    local done_flag   = sync_file .. ".dl_done"
+    local status_file = sync_file .. ".dl_status"
+
+    write_json_file(sync_file, self.ui.annotation.annotations)
+
+    local api = require("apps/cloudstorage/webdavapi")
+    local remote_path = api:getJoinedPath(server.address, server.url)
+    remote_path = api:getJoinedPath(remote_path, file_name .. ".json")
+
+    os.remove(done_flag)
+    os.remove(status_file)
+    os.remove(income_file)
+
+    -- Spawn curl in background; write HTTP status code to status_file then signal via done_flag.
+    local cmd = string.format(
+        "CODE=$(%s -s -o %s -w '%%{http_code}' --connect-timeout 10 -u %s:%s %s 2>/dev/null);" ..
+        " printf '%%s' \"$CODE\" > %s; touch %s",
+        CURL_PATH,
+        shell_quote(income_file),
+        shell_quote(server.username or ""),
+        shell_quote(server.password or ""),
+        shell_quote(remote_path),
+        shell_quote(status_file),
+        shell_quote(done_flag)
+    )
+    os.execute(cmd .. " &")
+
+    self.is_syncing = true
+    local start_time = os.time()
+    local lfs = require("libs/libkoreader-lfs")
+
+    local function complete_sync(http_code)
+        self.is_syncing = false
+
+        if not (self.ui and self.ui.annotation) then
+            os.remove(income_file)
+            return
+        end
+
+        if http_code ~= 200 and http_code ~= 404 then
+            logger.warn("Highlightsync: async download failed, http_code:", http_code)
+            os.remove(income_file)
+            return
+        end
+
+        local current_annotations = self.ui.annotation.annotations
+        local cached_highlights = read_json_file(cached_file) or {}
+        local income_highlights = http_code == 200 and (read_json_file(income_file) or {}) or {}
+
+        local merged = Merge.Merge_highlights(current_annotations, income_highlights, cached_highlights)
+        write_json_file(sync_file, merged)
+
+        self.ui.annotation.annotations = merged
+        if reload then
+            is_reloading_due_to_sync = true
+            UIManager:tickAfterNext(function()
+                self.ui:reloadDocument()
+            end)
+        end
+
+        -- Upload is blocking but brief (small JSON PUT to a responsive server).
+        local orig_block = socketutil.FILE_BLOCK_TIMEOUT
+        local orig_total = socketutil.FILE_TOTAL_TIMEOUT
+        socketutil.FILE_BLOCK_TIMEOUT = 4
+        socketutil.FILE_TOTAL_TIMEOUT = 10
+        local upload_code = api:uploadFile(remote_path, server.username, server.password, sync_file, nil)
+        socketutil.FILE_BLOCK_TIMEOUT = orig_block
+        socketutil.FILE_TOTAL_TIMEOUT = orig_total
+
+        os.remove(income_file)
+
+        if type(upload_code) == "number" and upload_code >= 200 and upload_code < 300 then
+            os.remove(cached_file)
+            local ffiUtil = require("ffi/util")
+            ffiUtil.copyFile(sync_file, cached_file)
+        else
+            logger.warn("Highlightsync: upload failed:", upload_code)
+        end
+    end
+
+    local function poll()
+        if lfs.attributes(done_flag, "mode") then
+            os.remove(done_flag)
+            local code_f = io.open(status_file, "r")
+            local http_code = 0
+            if code_f then
+                http_code = tonumber(code_f:read("*l")) or 0
+                code_f:close()
+                os.remove(status_file)
+            end
+            complete_sync(http_code)
+        elseif os.time() - start_time >= 30 then
+            logger.warn("Highlightsync: async download timed out")
+            self.is_syncing = false
+            os.remove(income_file)
+            os.remove(status_file)
+        else
+            UIManager:scheduleIn(0.3, poll)
+        end
+    end
+
+    UIManager:scheduleIn(0.3, poll)
+end
 
 function Highlightsync:addToMainMenu(menu_items)
 
