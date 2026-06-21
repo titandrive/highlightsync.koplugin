@@ -272,6 +272,18 @@ function Highlightsync:SyncBookHighlights(silent, reload)
 
     self.is_syncing = true
 
+    -- LuaSocket has no default timeout, so a stalled server blocks forever and
+    -- triggers an Android ANR. Patch socket.tcp for the duration of this call
+    -- so every socket operation times out after 8 seconds, giving the sync a
+    -- chance to fail gracefully before Android kills the process.
+    local socket = require("socket")
+    local orig_tcp = socket.tcp
+    socket.tcp = function()
+        local s = orig_tcp()
+        if s then s:settimeout(8) end
+        return s
+    end
+
     local ok, err = pcall(function()
         SyncService.sync(self.settings.sync_server, sync_file,
         function(local_path, cached_path, income_path)
@@ -286,10 +298,12 @@ function Highlightsync:SyncBookHighlights(silent, reload)
         silent)
     end)
 
+    socket.tcp = orig_tcp
+
     if not ok then
         logger.warn("Highlightsync: sync error:", err)
         self.is_syncing = false
-        -- sync_in_progress intentionally left set as crash guard
+        -- sync_in_progress left set: 300s cooldown before auto-sync retries
     end
 end
 
