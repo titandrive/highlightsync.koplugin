@@ -14,6 +14,7 @@ local NetworkMgr = require("ui/network/manager")
 local logger = require("logger")
 
 local is_reloading_due_to_sync = false
+local AUTO_SYNC_COOLDOWN = 300 -- seconds; auto-sync skipped after a crash for this long
 
 
 
@@ -145,16 +146,25 @@ function Highlightsync:init()
     self.ui.menu:registerToMainMenu(self)
 end
 
+-- Returns false if a previous sync was interrupted (process killed mid-download).
+-- Auto-expires after AUTO_SYNC_COOLDOWN seconds so the guard doesn't stick forever.
+function Highlightsync:shouldAutoSync()
+    if not self.settings.sync_in_progress then return true end
+    return (os.time() - (self.settings.sync_start_time or 0)) >= AUTO_SYNC_COOLDOWN
+end
+
 function Highlightsync:onReaderReady()
 
     if is_reloading_due_to_sync then
         is_reloading_due_to_sync = false
-        return 
+        return
     end
 
     if self.settings.sync_on_open and self:canSync() then
         UIManager:nextTick(function()
-            self:SyncBookHighlights(false, true)
+            if NetworkMgr:isWifiOn() and self:shouldAutoSync() then
+                self:SyncBookHighlights(false, true)
+            end
         end)
     end
 end
@@ -165,18 +175,18 @@ function Highlightsync:onCloseDocument()
         return
     end
 
-
     if self.settings.sync_on_close and self:canSync() then
-        -- Sincroniza e sai (sem reload, pois estamos saindo)
-        self:SyncBookHighlights(false, false) 
+        if NetworkMgr:isWifiOn() then
+            self:SyncBookHighlights(false, false)
+        end
     end
 end
 
 function Highlightsync:onResume()
-    
+
     if self.settings.sync_on_resume then
         UIManager:nextTick(function()
-            if NetworkMgr:isWifiOn() then
+            if NetworkMgr:isWifiOn() and self:shouldAutoSync() then
                 self:SyncBookHighlights(false, true)
                 self.settings.pending_sync = false
                 G_reader_settings:saveSetting("highlight_sync", self.settings)
@@ -188,27 +198,26 @@ end
 
 
 
-function Highlightsync:onSync(local_path, cached_path, income_path, reload)
+function Highlightsync:onSync(local_path, cached_path, income_path, reload, sidecar_dir, file_name, data_annotations)
 
-    local local_highlights  = DataAnnotations --read_json_file(local_path)  or {}
+    local local_highlights  = data_annotations
     local cached_highlights = read_json_file(cached_path) or {}
     local income_highlights = read_json_file(income_path) or {}
 
-    local annotations = Merge.Merge_highlights(local_highlights,income_highlights,cached_highlights)
+    local annotations = Merge.Merge_highlights(local_highlights, income_highlights, cached_highlights)
 
-    write_json_file(SidecarDir .. "/" .. FileName .. ".json", annotations) -- Save annotations local
-    DataAnnotations = annotations
+    write_json_file(sidecar_dir .. "/" .. file_name .. ".json", annotations)
 
     if self.ui and self.ui.annotation then
-        self.ui.annotation.annotations = DataAnnotations
+        self.ui.annotation.annotations = annotations
         if reload then
             is_reloading_due_to_sync = true
             UIManager:tickAfterNext(function()
-            self.ui:reloadDocument()
+                self.ui:reloadDocument()
             end)
         end
     end
-  
+
     return true
 end
 
@@ -241,32 +250,47 @@ function Highlightsync:SyncBookHighlights(silent, reload)
         return
     end
 
-    -- enable lock
-    self.is_syncing = true
-
     local doc_path = self.document and self.document.file
     local doc_settings = self.ui and self.ui.doc_settings
-    SidecarDir = doc_settings:getSidecarDir(doc_path)
-    ensure_dir_exists(SidecarDir)
-    DataAnnotations = self.ui.annotation.annotations -- self.ui.doc_settings.data.annotations
+    local sidecar_dir = doc_settings:getSidecarDir(doc_path)
+    ensure_dir_exists(sidecar_dir)
+    local data_annotations = self.ui.annotation.annotations
 
-    Raw_name = SidecarDir:match("([^/]+)/*$")
-    FileName = sanitize_filename(Raw_name)
+    local raw_name = sidecar_dir:match("([^/]+)/*$")
+    local file_name = sanitize_filename(raw_name)
+    local sync_file = sidecar_dir .. "/" .. file_name .. ".json"
 
-    write_json_file(SidecarDir .. "/" .. FileName .. ".json", self.ui.annotation.annotations) -- Save annotations local
+    write_json_file(sync_file, data_annotations)
 
-    SyncService.sync(self.settings.sync_server, SidecarDir .. "/" .. FileName .. ".json", 
-    function(local_path, cached_path, income_path)
-        local success = self:onSync(local_path, cached_path, income_path, reload)
-        self.is_syncing = false 
-        return success
-    end,
-    silent
-    )
+    -- Write crash guard to disk before the blocking network call.
+    -- If the process is killed mid-download (ANR), the next startup reads
+    -- sync_in_progress=true and shouldAutoSync() returns false, breaking
+    -- the crash loop. Cleared on success; auto-expires after AUTO_SYNC_COOLDOWN.
+    self.settings.sync_in_progress = true
+    self.settings.sync_start_time = os.time()
+    G_reader_settings:saveSetting("highlight_sync", self.settings)
 
-         
-         
-    
+    self.is_syncing = true
+
+    local ok, err = pcall(function()
+        SyncService.sync(self.settings.sync_server, sync_file,
+        function(local_path, cached_path, income_path)
+            local success = self:onSync(local_path, cached_path, income_path, reload,
+                                        sidecar_dir, file_name, data_annotations)
+            self.is_syncing = false
+            self.settings.sync_in_progress = nil
+            self.settings.sync_start_time = nil
+            G_reader_settings:saveSetting("highlight_sync", self.settings)
+            return success
+        end,
+        silent)
+    end)
+
+    if not ok then
+        logger.warn("Highlightsync: sync error:", err)
+        self.is_syncing = false
+        -- sync_in_progress intentionally left set as crash guard
+    end
 end
 
 
