@@ -184,7 +184,6 @@ function Highlightsync:onCloseDocument()
 end
 
 function Highlightsync:onResume()
-    
     if self.settings.sync_on_resume then
         UIManager:nextTick(function()
             if self:shouldAutoSync() and NetworkMgr:isConnected() then
@@ -192,7 +191,20 @@ function Highlightsync:onResume()
             end
         end)
     end
+end
 
+function Highlightsync:onAnnotationsModified()
+    if not self.settings.sync_on_annotation then return end
+    if self.annotation_sync_timer then
+        UIManager:unschedule(self.annotation_sync_timer)
+    end
+    self.annotation_sync_timer = function()
+        self.annotation_sync_timer = nil
+        if self:canSync() and self:shouldAutoSync() and NetworkMgr:isConnected() then
+            self:SyncBookHighlights(false, true)
+        end
+    end
+    UIManager:scheduleIn(3, self.annotation_sync_timer)
 end
 
 
@@ -476,6 +488,14 @@ function Highlightsync:addToMainMenu(menu_items)
                         checked_func = function() return self.settings.sync_on_resume end,
                         callback = function()
                             self.settings.sync_on_resume = not self.settings.sync_on_resume
+                            G_reader_settings:saveSetting("highlight_sync", self.settings)
+                        end,
+                    },
+                    {
+                        text = _("Sync on Annotation Change"),
+                        checked_func = function() return self.settings.sync_on_annotation end,
+                        callback = function()
+                            self.settings.sync_on_annotation = not self.settings.sync_on_annotation
                             G_reader_settings:saveSetting("highlight_sync", self.settings)
                         end,
                     },
