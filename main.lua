@@ -11,6 +11,7 @@ local SyncService = require("frontend/apps/cloudstorage/syncservice")
 local Merge = require("merge")
 local Transport = require("transport")
 local rapidjson = require("rapidjson")
+local Notification = require("ui/widget/notification")
 local NetworkMgr = require("ui/network/manager")
 local logger = require("logger")
 
@@ -356,9 +357,8 @@ function Highlightsync:SyncBookHighlights(silent, reload)
         if success then
             self:onSyncComplete(reload, context)
             if not silent then
-                UIManager:show(InfoMessage:new{
+                UIManager:show(Notification:new{
                     text = _("Highlights synchronized."),
-                    timeout = 2,
                 })
             end
         else
