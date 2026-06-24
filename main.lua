@@ -17,7 +17,6 @@ local logger = require("logger")
 
 local SYNC_POLL_INTERVAL = 0.25
 local SYNC_MAX_POLLS = 240 -- 60 seconds
-local UPDATE_MAX_POLLS = 480 -- 2 minutes
 
 local GITHUB_REPO = "titandrive/highlightsync.koplugin"
 local GITHUB_RAW_BASE = "https://raw.githubusercontent.com/" .. GITHUB_REPO .. "/master/"
