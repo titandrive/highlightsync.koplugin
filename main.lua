@@ -17,6 +17,7 @@ local logger = require("logger")
 
 local SYNC_POLL_INTERVAL = 0.25
 local SYNC_MAX_POLLS = 240 -- 60 seconds
+local UPDATE_MAX_POLLS = 480 -- 2 minutes
 
 local GITHUB_REPO = "titandrive/highlightsync.koplugin"
 local GITHUB_RAW_BASE = "https://raw.githubusercontent.com/" .. GITHUB_REPO .. "/master/"
@@ -451,30 +452,38 @@ end
 
 
 function Highlightsync:checkForUpdates()
-    local checking = InfoMessage:new{ text = _("Checking for updates…") }
+    local checking = InfoMessage:new{ text = "Checking for updates..." }
     UIManager:show(checking)
     UIManager:forceRePaint()
 
     local ok_https, https = pcall(require, "ssl.https")
-    local ok_ltn12, ltn12 = pcall(require, "ltn12")
-    if not ok_https or not ok_ltn12 then
+    if not ok_https then
         UIManager:close(checking)
-        UIManager:show(InfoMessage:new{ text = _("Update check requires network support."), timeout = 3 })
+        UIManager:show(InfoMessage:new{ text = "Update check requires network support.", timeout = 3 })
         return
     end
+    local ltn12 = require("ltn12")
+
+    local ok_sutil, socketutil = pcall(require, "socketutil")
+    if ok_sutil then socketutil:set_timeout(5, 15) end
 
     local body = {}
-    local _, status = https.request{
-        url = GITHUB_RAW_BASE .. "_meta.lua",
-        method = "GET",
-        headers = { ["User-Agent"] = "KOReader-HighlightSync/" .. PLUGIN_VERSION },
-        sink = ltn12.sink.table(body),
-    }
+    local ok_req, status = pcall(function()
+        local _, s = https.request{
+            url = GITHUB_RAW_BASE .. "_meta.lua",
+            method = "GET",
+            headers = { ["User-Agent"] = "KOReader-HighlightSync/" .. PLUGIN_VERSION },
+            sink = ltn12.sink.table(body),
+        }
+        return s
+    end)
+
+    if ok_sutil then pcall(function() socketutil:reset_timeout() end) end
     UIManager:close(checking)
 
-    if status ~= 200 then
+    if not ok_req or status ~= 200 then
         UIManager:show(InfoMessage:new{
-            text = _("Could not reach update server. Check your network connection."),
+            text = "Could not reach update server. Check your network connection.",
             timeout = 3,
         })
         return
@@ -482,7 +491,7 @@ function Highlightsync:checkForUpdates()
 
     local latest = table.concat(body):match('version%s*=%s*"([^"]+)"')
     if not latest then
-        UIManager:show(InfoMessage:new{ text = _("Could not read version information."), timeout = 3 })
+        UIManager:show(InfoMessage:new{ text = "Could not read version information.", timeout = 3 })
         return
     end
 
@@ -495,9 +504,9 @@ function Highlightsync:checkForUpdates()
     end
 
     UIManager:show(ConfirmBox:new{
-        text = "Version " .. latest .. " is available (installed: " .. PLUGIN_VERSION .. "). Install now?",
-        ok_text = _("Install"),
-        cancel_text = _("Later"),
+        text = "Version " .. latest .. " is available (installed: v" .. PLUGIN_VERSION .. "). Install now?",
+        ok_text = "Install",
+        cancel_text = "Later",
         ok_callback = function()
             self:installUpdate(latest)
         end,
@@ -505,31 +514,28 @@ function Highlightsync:checkForUpdates()
 end
 
 function Highlightsync:installUpdate(version)
-    local ok_https, https = pcall(require, "ssl.https")
-    if not ok_https then
-        UIManager:show(InfoMessage:new{ text = _("Update failed: network support unavailable."), timeout = 3 })
-        return
-    end
-    local ok_ltn12, ltn12 = pcall(require, "ltn12")
-    if not ok_ltn12 then
-        UIManager:show(InfoMessage:new{ text = _("Update failed: ltn12 unavailable."), timeout = 3 })
-        return
-    end
-
-    local msg = InfoMessage:new{ text = _("Downloading update…") }
+    local msg = InfoMessage:new{ text = "Downloading update..." }
     UIManager:show(msg)
     UIManager:forceRePaint()
 
-    local files = { "_meta.lua", "main.lua", "merge.lua", "transport.lua", "insert_menu.lua" }
+    local ok_https, https = pcall(require, "ssl.https")
+    if not ok_https then
+        UIManager:close(msg)
+        UIManager:show(InfoMessage:new{ text = "Update failed: network support unavailable.", timeout = 3 })
+        return
+    end
+    local ltn12 = require("ltn12")
 
+    local ok_sutil, socketutil = pcall(require, "socketutil")
+    if ok_sutil then socketutil:set_timeout(10, 60) end
+
+    local files = { "_meta.lua", "main.lua", "merge.lua", "transport.lua", "insert_menu.lua" }
     for _, fname in ipairs(files) do
         local f = io.open(self.path .. "/" .. fname, "wb")
         if not f then
+            if ok_sutil then pcall(function() socketutil:reset_timeout() end) end
             UIManager:close(msg)
-            UIManager:show(InfoMessage:new{
-                text = "Update failed: could not write " .. fname,
-                timeout = 3,
-            })
+            UIManager:show(InfoMessage:new{ text = "Update failed: could not write " .. fname, timeout = 3 })
             return
         end
         local ok_req, fstatus = pcall(function()
@@ -543,15 +549,14 @@ function Highlightsync:installUpdate(version)
         end)
         if not ok_req then pcall(function() f:close() end) end
         if not ok_req or fstatus ~= 200 then
+            if ok_sutil then pcall(function() socketutil:reset_timeout() end) end
             UIManager:close(msg)
-            UIManager:show(InfoMessage:new{
-                text = "Update failed: could not download " .. fname,
-                timeout = 3,
-            })
+            UIManager:show(InfoMessage:new{ text = "Update failed: could not download " .. fname, timeout = 3 })
             return
         end
     end
 
+    if ok_sutil then pcall(function() socketutil:reset_timeout() end) end
     UIManager:close(msg)
     UIManager:show(InfoMessage:new{
         text = "HighlightSync updated to v" .. version .. ". Please restart KOReader.",
